@@ -1,0 +1,48 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ollama-spark/qwen3.6",
+  "default_agent": "oscar",
+  "agent": {
+    "oscar": {
+      "description": "Orchestrator - coordinates, delegates, synthesizes",
+      "mode": "primary",
+      "prompt": "{file:~/.config/opencode/agent/oscar.md}"
+    },
+    "scout": {
+      "description": "Researcher + Planner - deep analysis, actionable plans",
+      "mode": "subagent",
+      "prompt": "{file:~/.config/opencode/agent/scout.md}"
+    },
+    "ivan": {
+      "description": "Implementor - writes code, runs tests, git operations",
+      "mode": "subagent",
+      "prompt": "{file:~/.config/opencode/agent/ivan.md}"
+    },
+    "jester": {
+      "description": "Truth-Teller (default) - challenges assumptions",
+      "mode": "subagent",
+      "model": "opencode/nemotron-3-ultra-free",
+      "prompt": "{file:~/.config/opencode/agent/jester.md}"
+    },
+    "jester_opus": {
+      "description": "Jester (Opus) - Truth-teller using Claude Opus",
+      "mode": "subagent",
+      "model": "opencode/deepseek-v4-flash-free",
+      "prompt": "{file:~/.config/opencode/agent/jester.md}"
+    },
+    "jester_qwen": {
+      "description": "Jester (Qwen) - Truth-teller using Qwen3 Coder",
+      "mode": "subagent",
+      "model": "google/gemini-2.5-pro",
+      "prompt": "{file:~/.config/opencode/agent/jester.md}"
+    },
+    "jester_grok": {
+      "description": "Jester (Grok) - Truth-teller using Grok",
+      "mode": "subagent",
+      "model": "zen/grok-3",
+      "prompt": "{file:~/.config/opencode/agent/jester.md}"
+    },
+    "plan": { "disable": true },
+    "build": { "disable": true }
+  }
+}
