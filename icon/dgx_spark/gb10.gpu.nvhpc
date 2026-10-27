@@ -1,0 +1,190 @@
+#!/bin/bash
+
+# ICON
+#
+# ------------------------------------------
+# Copyright (C) 2004-2026, DWD, MPI-M, DKRZ, KIT, ETH, MeteoSwiss
+# Contact information: icon-model.org
+# See AUTHORS.TXT for a list of authors
+# See LICENSES/ for license information
+# SPDX-License-Identifier: BSD-3-Clause
+# ------------------------------------------
+#
+# GPU configure wrapper for the NVIDIA GB10 (DGX Spark) container built from
+# config/docker/gb10/Dockerfile.
+#
+# This is config/dkrz/dolpung.gpu.nvhpc-25.7 with the Spack prefixes replaced by
+# what the container actually provides:
+#
+#   compilers, CUDA, CUDA-aware OpenMPI : the NVIDIA HPC SDK at ${NVHPC_ROOT}
+#   NetCDF-C, HDF5, libfyaml, libxml2   : Ubuntu packages under /usr
+#   NetCDF-Fortran                      : built with nvfortran into ${NETCDFF_ROOT}
+#                                         (a gfortran-built libnetcdff has .mod
+#                                          files nvfortran cannot read)
+#
+# eccodes is deliberately absent: GRIB output is not enabled in this container,
+# so nothing links against it.
+#
+# Use it out of source, exactly like the dolpung wrappers:
+#
+#     mkdir -p build_gpu && cd build_gpu
+#     /path/to/icon/config/docker/gb10/gb10.gpu.nvhpc
+#     make -j"$(nproc)"
+
+set -eu
+unset CDPATH
+ulimit -c 0
+
+script_dir=$(cd "$(dirname "$0")"; pwd)
+# config/docker/gb10 -> three levels up to the source root. When this wrapper is
+# used from outside the source tree (the container installs it under
+# /usr/local/share/icon-gb10), ICON_DIR overrides the guess.
+icon_dir=${ICON_DIR:-$(cd "${script_dir}/../../.."; pwd)}
+
+NVHPC_ROOT="${NVHPC_ROOT:-/opt/nvidia/hpc_sdk/current}"
+MPI_ROOT="${MPI_ROOT:-${NVHPC_ROOT}/comm_libs/mpi}"
+# The HPC SDK's cuda/ directory only symlinks bin, include, lib64 and nvvm from
+# the versioned subdirectory -- it has no targets/, which is exactly what CMake's
+# FindCUDAToolkit derives CUDA::cudart's include path from. Pointing
+# CUDAToolkit_ROOT at cuda/ therefore breaks the CMake-built externals (memman,
+# fortran-support) with "Imported target CUDA::cudart includes non-existent
+# path .../cuda/targets/sbsa-linux/include". Use the versioned directory, the
+# way config/dkrz/dolpung.gpu.nvhpc-25.7 does with cuda/12.9.
+CUDA_ROOT="${CUDA_HOME:-${NVHPC_ROOT}/cuda}"
+if test ! -d "${CUDA_ROOT}/targets"; then
+  for _cuda_dir in "${CUDA_ROOT}"/[0-9]*.[0-9]*; do
+    test -d "${_cuda_dir}/targets" && CUDA_ROOT="${_cuda_dir}" && break
+  done
+fi
+test -d "${CUDA_ROOT}/targets" || {
+  echo "$0: no CUDA toolkit with a targets/ directory under ${CUDA_HOME:-${NVHPC_ROOT}/cuda}" >&2
+  exit 1
+}
+NETCDFF_ROOT="${NETCDFF_ROOT:-/opt/netcdf-fortran}"
+
+multiarch="$(uname -m)-linux-gnu"
+
+STDCPP_LIBS='-lstdc++'
+CUDA_LIBS='-lcudart -lcuda'
+
+HDF5_ROOT="/usr"
+HDF5_INCLUDE="/usr/include/hdf5/serial"
+HDF5_LIBDIR="/usr/lib/${multiarch}/hdf5/serial"
+HDF5_LIBS='-lhdf5_hl -lhdf5'
+
+NETCDF_ROOT="/usr"
+NETCDF_LIBS='-lnetcdf'
+NETCDFF_LIBS='-lnetcdff'
+
+BLAS_LAPACK_LIBS='-llapack -lblas'
+
+FYAML_LIBS='-lfyaml'
+XML2_ROOT='/usr'
+XML2_LIBS='-lxml2'
+
+# `ccnative` -- NOT `native`, which nvfortran 25.9 rejects -- compiles for the
+# GPU visible at build time. On this machine that resolves to cc121 (GB10).
+# Override with GPU_TARGET=cc121 to pin it, e.g. when building without a GPU
+# attached to the container.
+GPU_TARGET="${GPU_TARGET:-ccnative}"
+# nvcc needs the same target expressed its own way.
+case "${GPU_TARGET}" in
+  ccnative) CUDA_ARCH='native' ;;
+  cc*)      CUDA_ARCH="sm_${GPU_TARGET#cc}" ;;
+  sm_*)     CUDA_ARCH="${GPU_TARGET}" ;;
+  *)        CUDA_ARCH='native' ;;
+esac
+
+# GB10 has physically unified, coherent CPU/GPU memory. UNIFIED_MEM=1 appends
+# mem:unified so the compiler stops emitting explicit data movement -- useful to
+# get something running, but it hides where the traffic is, so it is off by
+# default.
+GPU_OPTS="${GPU_TARGET}"
+[ "${UNIFIED_MEM:-0}" = 1 ] && GPU_OPTS="${GPU_OPTS},mem:unified"
+
+################################################################################
+
+# LDSHARED is overridden because the bundled Python bindings (YAC's, built when
+# --enable-bundled-python includes yac) are linked by setuptools, which takes its
+# link command from the sysconfig of the interpreter -- and that interpreter was
+# built with gcc. Its LDSHARED carries -fwrapv, which nvc rejects outright:
+#     nvc-Error-Unknown switch: -fwrapv
+# Replacing it with "<CC> -shared" keeps the flags that come from this file and
+# drops the ones that describe someone else's compiler.
+BUILD_ENV="export LD_LIBRARY_PATH=\"${HDF5_LIBDIR}:${NETCDFF_ROOT}/lib:\${LD_LIBRARY_PATH:-}\"; export LIBRARY_PATH=\"/usr/lib/${multiarch}:${CUDA_ROOT}/lib64/stubs:\${LIBRARY_PATH:-}\"; export CUDAToolkit_ROOT='${CUDA_ROOT}'; export LDSHARED=\"${MPI_ROOT}/bin/mpicc -shared\";"
+
+CC="${MPI_ROOT}/bin/mpicc"
+CFLAGS='-g -O2'
+
+# Let YAC find LAPACK with the C compiler:
+ICON_YAC_CFLAGS='-fortranlibs'
+
+CXX="${NVHPC_ROOT}/compilers/bin/nvc++"
+CXXFLAGS='-g -O2'
+
+CPPFLAGS="-I${HDF5_INCLUDE} -I${NETCDF_ROOT}/include -I${XML2_ROOT}/include/libxml2"
+
+FC="${MPI_ROOT}/bin/mpifort"
+FCFLAGS="-I${NETCDFF_ROOT}/include -g -O2 -Mrecursive -Mallocatable=03 -Mstack_arrays -Minfo=accel,inline -acc=gpu,verystrict -gpu=${GPU_OPTS}"
+
+CUDACXX="${CUDA_ROOT}/bin/nvcc"
+CUDAFLAGS="-arch=${CUDA_ARCH} -g -O3" # workaround: use the default host compiler instead of -ccbin=${CXX}
+
+ICON_LDFLAGS="-c++libs -nvmalloc" # avoid passing it to g++ compiler as linker flags
+LDFLAGS="-L${HDF5_LIBDIR} -L/usr/lib/${multiarch} -L${NETCDFF_ROOT}/lib -L${CUDA_ROOT}/lib64"
+
+LIBS="-Wl,--as-needed ${XML2_LIBS} ${FYAML_LIBS} ${BLAS_LAPACK_LIBS} ${NETCDFF_LIBS} ${NETCDF_LIBS} ${HDF5_LIBS} ${STDCPP_LIBS} ${CUDA_LIBS}"
+
+MPI_LAUNCH="${MPI_ROOT}/bin/mpiexec"
+
+# --disable-mpi-checks: the configure-time MPI probes launch jobs, which needs a
+# working launcher inside the container and is not worth the trouble here.
+EXTRA_CONFIG_ARGS='--enable-gpu --enable-mpi-gpu --enable-bundled-python=mtime --enable-cuda-graphs --enable-realloc-buf --enable-pgi-inlib --disable-mpi-checks'
+
+################################################################################
+
+"${icon_dir}/configure" \
+BUILD_ENV="${BUILD_ENV}" \
+CC="${CC}" \
+CFLAGS="${CFLAGS}" \
+CPPFLAGS="${CPPFLAGS}" \
+CUDACXX="${CUDACXX}" \
+CUDAFLAGS="${CUDAFLAGS}" \
+CXX="${CXX}" \
+CXXFLAGS="${CXXFLAGS}" \
+FC="${FC}" \
+FCFLAGS="${FCFLAGS}" \
+ICON_YAC_CFLAGS="${ICON_YAC_CFLAGS}" \
+LDFLAGS="${LDFLAGS}" \
+ICON_LDFLAGS="${ICON_LDFLAGS}" \
+LIBS="${LIBS}" \
+MPI_LAUNCH="${MPI_LAUNCH}" \
+${EXTRA_CONFIG_ARGS} \
+"$@"
+
+for arg in "$@"; do
+  case $arg in
+    -help | --help | --hel | --he | -h | -help=r* | --help=r* | --hel=r* | --he=r* | -hr* | -help=s* | --help=s* | --hel=s* | --he=s* | -hs*)
+      test -n "${EXTRA_CONFIG_ARGS}" && echo '' && echo "This wrapper script ('$0') calls the configure script with the following extra arguments, which might override the default values listed above: ${EXTRA_CONFIG_ARGS}"
+      exit 0 ;;
+  esac
+done
+
+# Copy runscript-related files when building out-of-source:
+if test $(pwd) != $(cd "${icon_dir}"; pwd); then
+  echo "Copying runscript input files from the source directory..."
+  rsync -uavz ${icon_dir}/run . --exclude='*.in' --exclude='.*' --exclude='standard_*' --exclude=mkexp
+  ln -sf -t run/ ${icon_dir}/run/{standard_*,mkexp}
+  for dir in \
+    'externals/art/runctrl_examples' \
+    'externals/ecrad/data' \
+    'externals/jsbach/data'
+  do
+    src="${icon_dir}/${dir}"
+    test -d "${src}" && mkdir -p "${dir}" && rsync -uavz "${src}/" "${dir}"
+  done
+  rsync -uavz ${icon_dir}/make_runscripts .
+  rsync -uavz ${icon_dir}/scripts .
+  ln -sf ${icon_dir}/data
+  ln -sf ${icon_dir}/vertical_coord_tables
+fi

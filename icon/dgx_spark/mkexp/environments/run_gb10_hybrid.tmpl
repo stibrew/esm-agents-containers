@@ -1,0 +1,324 @@
+#%#- ICON
+#%#-
+#%#- ---------------------------------------------------------------
+#%#- Copyright (C) 2004-2026, DWD, MPI-M, DKRZ, KIT, ETH, MeteoSwiss
+#%#- Contact information: icon-model.org
+#%#-
+#%#- See AUTHORS.TXT for a list of authors
+#%#- See LICENSES/ for license information
+#%#- SPDX-License-Identifier: BSD-3-Clause
+#%#- ---------------------------------------------------------------
+#%#
+#%# Everything hybrid-run-specific for a single GB10 (DGX Spark).
+#%#
+#%# DEFAULT.run.tmpl imports this file as
+#%#   'mkexp/environments/run_'+ENVIRONMENT+'.tmpl'
+#%# whenever the run job has a [[[hybrid]]] section, and calls the macros
+#%# below. It is the Spark-sized counterpart of run_dolpung_hybrid.tmpl; the
+#%# macro set and the shell variables each one has to define are the same, but
+#%# a machine with one GPU, one NUMA domain, no InfiniBand and no scheduler
+#%# needs far less of it.
+#%#
+#
+# $Id: config/docker/gb10/mkexp/environments/run_gb10_hybrid.tmpl 1 2026-09-01 $
+
+#%#------------------------
+#% macro set_mpi_variables(JOB, namelists):
+nr_of_hiopy_workers=%{hiopy.nr_of_workers if hiopy is defined else 0}
+#%# YACO is the other output component this environment can launch (issue #23:
+#%# the comparison between hiopy, YACO's C++ binary and the Python port). It
+#%# occupies ranks exactly the way hiopy's workers do -- taken out of the
+#%# ocean's share, appended after the ocean in MPI_COMM_WORLD -- so everything
+#%# below counts the two together and only the wrapper script differs.
+nr_of_yaco_ranks=%{yaco.nr_of_ranks if yaco is defined else 0}
+nr_of_output_ranks=$(( nr_of_hiopy_workers + nr_of_yaco_ranks ))
+no_of_nodes=%{JOB.nodes|d(1)}
+export atm_procs_per_node=%{JOB.hybrid.atm.gpus_per_node|d(JOB.default_gpus_per_node)}
+export oce_procs_per_node=%{JOB.hybrid.oce.cpus_per_node|d(JOB.default_cpus_per_node)}
+
+# One node, so "per node" and "total" are the same thing.
+atm_procs=$(( atm_procs_per_node * no_of_nodes ))
+oce_procs=$(( oce_procs_per_node * no_of_nodes - nr_of_output_ranks ))
+echo "atm_procs: ${atm_procs}"
+echo "oce_procs: ${oce_procs}"
+#%# Define *_io_procs variable and replace the namelist parameter by it
+export atm_io_procs=%{namelists.NAMELIST_atm.parallel_nml.num_io_procs}
+#% set _ = namelists.NAMELIST_atm.parallel_nml.update({"num_io_procs": "raw(${atm_io_procs})"})
+export oce_io_procs=%{namelists.NAMELIST_oce.parallel_nml.num_io_procs}
+#% set _ = namelists.NAMELIST_oce.parallel_nml.update({"num_io_procs": "raw(${oce_io_procs})"})
+#%# Output through the coupler means the worker ranks write, not ICON's own
+#%# I/O ranks -- that is what coupled_to_output = true asks for. True for YACO
+#%# for the same reason it is true for hiopy.
+#%  if hiopy is defined or yaco is defined:
+#%# ... unless the experiment explicitly asked for I/O ranks anyway, which is how
+#%# the ADIOS2 output writer (mo_output_adios) is exercised under asynchronous
+#%# output: it publishes from the compute ranks, so p_comm_work excluding the
+#%# I/O ranks is the case worth testing. A zero stays zero.
+[ "${atm_io_procs:-0}" -gt 0 ] || atm_io_procs=0
+[ "${oce_io_procs:-0}" -gt 0 ] || oce_io_procs=0
+#%  endif
+echo "atm_io_procs: ${atm_io_procs}"
+echo "oce_io_procs: ${oce_io_procs}"
+
+mpi_total_procs=$(( atm_procs + oce_procs + atm_io_procs + oce_io_procs + nr_of_output_ranks ))
+echo "mpi_total_procs: ${mpi_total_procs}"
+
+# Everything that is not an atmosphere compute rank runs on a core: the
+# dedicated I/O ranks of both components, the ocean, and any hiopy worker.
+cpu_total_procs=$(( oce_procs + atm_io_procs + oce_io_procs + nr_of_output_ranks ))
+export cpu_procs_per_node=$(( cpu_total_procs / no_of_nodes ))
+echo "cpu_procs_per_node: ${cpu_procs_per_node}"
+
+# There is no scheduler to reject an allocation that does not fit, so say so
+# here instead. Oversubscribing a 20-core box does not fail, it just runs the
+# GPU rank behind a queue of ocean ranks, which is a slow success and much
+# harder to spot than an error.
+if [ ${mpi_total_procs} -gt %{JOB.default_cpus_per_node} ] ; then
+  echo "Total task count (${mpi_total_procs}) exceeds the %{JOB.default_cpus_per_node} cores of this machine;"
+  echo "lower jobs:run:hybrid:oce:cpus_per_node or the num_io_procs of either component."
+  check_error 1
+  exit 1
+fi
+#%- endmacro
+
+
+#%#------------------------
+#% macro set_mpi_variables_2():
+mpi_oce_procs=$oce_procs
+mpi_atm_procs=$atm_procs
+#%- endmacro
+
+
+#%#------------------------
+#% macro split_tasks():
+#%# The atmosphere takes the low ranks of MPI_COMM_WORLD, including its own
+#%# dedicated I/O ranks, and the ocean takes the rest. mpmd-launch.sh relies on
+#%# this ordering; see write_mpmd_file below.
+atm_min_rank=0
+atm_max_rank=$((atm_procs - 1 + atm_io_procs))
+atm_group_size=1
+atm_inc_rank=1
+
+oce_min_rank=$((atm_max_rank + 1 ))
+oce_max_rank=$((atm_max_rank + oce_procs + oce_io_procs))
+oce_group_size=1
+oce_inc_rank=1
+
+echo "atm_min_rank: $atm_min_rank"
+echo "atm_max_rank: $atm_max_rank"
+echo "oce_min_rank: $oce_min_rank"
+echo "oce_max_rank: $oce_max_rank"
+#%- endmacro
+
+
+#%#------------------------
+#% macro write_host_file(use_hostfile=None):
+#% if use_hostfile is set:
+#%   do die("use_hostfile is not supported by the gb10_hybrid environment: there is one host")
+#% endif
+# One host, so no host file: mpirun places the ranks it is given, in order.
+#%- endmacro
+
+
+#%#------------------------
+#% macro write_run_wrapper_gpu():
+#-----------------------------------------------------------------------------
+# Atmosphere wrapper. On dolpung this maps rank -> GPU -> NUMA domain -> NIC
+# across four of each; here there is one GPU, one NUMA domain and no NIC, so
+# what is left is handing the device to the only rank that should have it.
+#
+rm -f run_model_gpu.sh
+
+cat > run_model_gpu.sh << EOF
+#! /usr/bin/bash
+
+export CUDA_VISIBLE_DEVICES=0
+export OMP_NUM_THREADS=1
+export ICON_THREADS=1
+export NVCOMPILER_ACC_USE_GRAPH=1    # Nvidia: Currently necessary to properly set the OpenACC runtime for graph capture
+
+exec ${MODEL_atm}
+
+EOF
+
+chmod 755 ./run_model_gpu.sh
+#%- endmacro
+
+
+#%#------------------------
+#% macro write_run_wrapper_cpu():
+#-----------------------------------------------------------------------------
+# Ocean (and I/O) wrapper. No numactl and no core list: one NUMA domain, and
+# leaving placement to the OS beats pinning ranks to cores the atmosphere rank
+# also needs for its host-side work.
+#
+rm -f run_model_cpu.sh
+
+cat > run_model_cpu.sh << EOF
+#! /usr/bin/bash
+
+#%  for var in JOB.hybrid.oce.env:
+export %{var}=%{JOB.hybrid.oce.env[var]}
+#%  endfor
+#%#
+# Empty, not unset: an empty value hides every device, whereas unsetting it
+# exposes all of them. An ocean rank that opens a CUDA context takes memory
+# from the atmosphere for nothing.
+export CUDA_VISIBLE_DEVICES=
+
+exec ${MODEL_oce}
+
+EOF
+
+chmod 755 ./run_model_cpu.sh
+#%  if yaco is defined:
+#%   set fdb_worker_zooms = ([yaco.zooms] if yaco.zooms is string else yaco.zooms) if 'zooms' in yaco else []
+#%   if fdb_worker_zooms|length > 1 and yaco.get('zoom_mode', 'derived') == 'coupled':
+#%    for zoom in fdb_worker_zooms:
+%{write_run_wrapper_yaco('run_yaco_z' ~ zoom ~ '.sh', DATA_DIR ~ '/fdb_worker_z' ~ zoom ~ '.yaml')}
+#%    endfor
+#%   else:
+%{write_run_wrapper_yaco()}
+#%   endif
+#%  endif
+#-----------------------------------------------------------------------------
+#%- endmacro
+
+
+#%#------------------------
+#%# The YACO wrapper. Called from write_run_wrapper_cpu rather than directly by
+#%# DEFAULT.run.tmpl, which has a hiopy hook but no YACO one; keeping the call
+#%# here means ICON's shared default template needs no change.
+#%#
+#%# YACO takes its whole configuration from one YAML file named on the command
+#%# line, and reads the YAC coupling YAML named inside it, so unlike hiopy there
+#%# is nothing to pass but that path. Both files are written by the experiment's
+#%# own `pre`-style step and copied into the work directory beside this script.
+#%#
+#%# With `[yaco] zoom_mode = coupled` and more than one `[yaco] zooms`, this
+#%# is done once per healpix level: one wrapper run_yaco_z<order>.sh naming
+#%# $DATA_DIR/fdb_worker_z<order>.yaml, and one mpmd rank range each. That is the
+#%# only shape the C++ binary can run several levels in -- a YACO process
+#%# reads ONE global grid (main.cpp takes `grid` before it looks its own rank
+#%# up) and has no coarsening, it archives exactly what YAC delivers -- and it
+#%# is production's (configure_yaco.sh: "1 yaco task per nside-level"). The
+#%# file names are fdb-worker-configure's, and the rank blocks are contiguous
+#%# and in `zooms` order, which is how its split_ranks hands them out; YACO
+#%# aborts if the rank it finds itself on has no `yac_input: ranks:` entry, so
+#%# the two have to agree. Without `zoom_mode = coupled` -- one level, or the
+#%# Python port's `derived` mode, where the coarse levels are averaged inside
+#%# the same processes -- there is one wrapper and one range, exactly as
+#%# before.
+#%#
+#%# NB: a `#%#` comment line inside a macro emits a blank line into the
+#%# generated script; that is why the explanation lives out here.
+#%#
+#%# `[yaco] args`, when the experiment sets it, is appended to that command
+#%# line. No surviving setup sets it: io_fdb_worker used it for
+#%# `--coarsen-config <fdb_worker_z5.yaml>`, which fdb-worker now finds by itself
+#%# beside fdb_worker_z6.yaml (the second healpix level, derived in the worker from
+#%# the coupled one, needs a configuration but no ranks and no couplings of
+#%# its own). It stays for extra worker options. It is
+#%# behind an `if` rather than given an empty default because a `#%#` or a
+#%# trailing expansion inside the here-document is emitted verbatim: a setup
+#%# without extra arguments has to write exactly the line it always wrote.
+#%# `script` and `config_file` are what a multi-zoom setup varies; their
+#%# defaults reproduce the single-wrapper output this macro always wrote.
+#% macro write_run_wrapper_yaco(script='run_yaco.sh', config_file=''):
+rm -f %{script}
+
+cat > %{script} << 'EOF'
+#! /usr/bin/bash
+#%# .get(), not attribute access: JOB.hybrid has no yaco subsection unless the
+#%# experiment gives it one, and `JOB.hybrid.yaco.env` raises on a configobj
+#%# Section before a |d({}) default could apply.
+#%  set yaco_env = JOB.hybrid.get('yaco', {}).get('env', {})
+#%  for var in yaco_env:
+export %{var}=%{yaco_env[var]}
+#%  endfor
+#%#
+# Same reasoning as the ocean wrapper: an output rank that opens a CUDA context
+# takes memory from the atmosphere and gets nothing for it. Narrow UCX's
+# transport list to match, since the image's default names CUDA transports that
+# are then genuinely unavailable on this rank.
+export CUDA_VISIBLE_DEVICES=
+export UCX_TLS=self,sysv,sm
+
+#%  set yaco_config = config_file or yaco.config_file
+#%  if 'args' in yaco:
+exec %{yaco['exec']} %{yaco_config} %{yaco.args}
+#%  else:
+exec %{yaco['exec']} %{yaco_config}
+#%  endif
+EOF
+
+chmod 755 ./%{script}
+#-----------------------------------------------------------------------------
+#%- endmacro
+
+
+#%#------------------------
+#% macro write_run_wrapper_hiopy():
+cat > run_hiopy.sh << 'EOF'
+#! /usr/bin/bash
+#%  for var in JOB.hybrid.hiopy.env:
+export %{var}=%{JOB.hybrid.hiopy.env[var]}
+#%  endfor
+#%#
+export CUDA_VISIBLE_DEVICES=
+source %{hiopy.venv}/bin/activate
+
+#%  set base = DATA_DIR
+#%  set args = ''
+#%#
+#%  if hiopy.storage_backend == 's3':
+#%    set s3_dict = {}
+#%    do s3_dict.update(key = '${S3_KEY}')
+#%    do s3_dict.update(secret = '${S3_SECRET}')
+#%    do s3_dict.update(endpoint_url = hiopy.storage.s3.endpoint_url)
+#%#
+#%    set base = 's3://'+hiopy.storage.s3.bucket
+#%    set args = '--s3-storage-options "'+s3_dict|replace("'", '\\"')+'"'
+#% endif
+
+hiopy-worker --zarr-store-protocol "%{hiopy.storage_backend}" \
+             --zarr-store-path "%{base}/%{hiopy.relative_path_to_dataset}" \
+             --nthreads %{JOB.hybrid.hiopy.env["OMP_NUM_THREADS"]} %{args}
+EOF
+
+chmod 755  ./run_hiopy.sh
+#-----------------------------------------------------------------------------
+#%- endmacro
+
+
+#%#------------------------
+#% macro write_mpmd_file(use_mpmd=None):
+#% if use_mpmd is set:
+#%# SLURM multi-prog syntax, even though nothing here is SLURM: mkexp's run
+#%# script invokes "${START} --multi-prog icon_mpmd.conf", and on this machine
+#%# ${START} is config/docker/gb10/mpmd-launch.sh, which reads this file and
+#%# turns it into OpenMPI's colon-separated MPMD form.
+cat > icon_mpmd.conf << EOF
+0-$(( atm_procs - 1 )) ./run_model_gpu.sh
+#%  if hiopy is defined:
+$(( oce_max_rank + 1 ))-$(( oce_max_rank + %{hiopy.nr_of_workers})) ./run_hiopy.sh
+#%  endif
+#%  if yaco is defined:
+#%# After the ocean, and after hiopy's workers if both are configured. YACO's
+#%# own config addresses its ranks by absolute MPI_COMM_WORLD rank under
+#%# `yac_input: ranks:`, so this range and that key have to agree.
+#%  set fdb_worker_zooms = ([yaco.zooms] if yaco.zooms is string else yaco.zooms) if 'zooms' in yaco else []
+#%  if fdb_worker_zooms|length > 1 and yaco.get('zoom_mode', 'derived') == 'coupled':
+#%   set yaco_ranks_per_zoom = yaco.nr_of_ranks|int // fdb_worker_zooms|length
+#%   for zoom in fdb_worker_zooms:
+#%    set yaco_offset = loop.index0 * yaco_ranks_per_zoom
+$(( oce_max_rank + 1 + nr_of_hiopy_workers + %{yaco_offset} ))-$(( oce_max_rank + nr_of_hiopy_workers + %{yaco_offset + yaco_ranks_per_zoom} )) ./run_yaco_z%{zoom}.sh
+#%   endfor
+#%  else:
+$(( oce_max_rank + 1 + nr_of_hiopy_workers ))-$(( oce_max_rank + nr_of_hiopy_workers + %{yaco.nr_of_ranks})) ./run_yaco.sh
+#%  endif
+#%  endif
+* ./run_model_cpu.sh
+EOF
+#% endif
+#%- endmacro

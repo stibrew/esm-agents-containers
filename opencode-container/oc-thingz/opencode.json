@@ -1,0 +1,35 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ollama-spark/qwen3.6",
+  "small_model": "ollama-spark/qwen3.6",
+  "provider": {
+    "ollama-spark": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "ollama-spark",
+      "options": {
+      },
+      "models": {
+        "qwen3.6": {
+          "name": "qwen3.6"
+        },
+        "nemotron-3-super": {
+          "name": "nemotron-3-super"
+        },
+        "devstral-small-2": {
+          "name": "devstral-small-2"
+        }
+      }
+    }
+  },
+  "agent": {
+    "plan": {
+      "model": "ollama-spark/qwen3.6"
+    },
+    "plan-review": {
+      "model": "ollama-spark/qwen3.6"
+    },
+    "adversary": {
+      "model": "ollama-spark/qwen3.6"
+    }
+  }
+}
